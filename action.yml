@@ -23,18 +23,16 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
-      - name: Sync head branch with base branch (commits)
-        id: sync-commits
+      - name: Compute sync metadata
+        id: compute-sync
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        shell: bash
         run: |
-          #!/usr/bin/env bash
           set -euo pipefail
-
-          GITHUB_API_URL="https://api.github.com"
 
           git fetch origin "$BASE_BRANCH" "$HEAD_BRANCH"
           git checkout "$HEAD_BRANCH"
@@ -42,14 +40,45 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          UPDATED_COMMITS="false"
-          SYNC_MODE="none"
-          SYNC_PR_URL=""
-          SYNC_PR_NUMBER=""
-          SYNC_BRANCH=""
-          SYNC_COMMITS_MESSAGE=""
-
           COMMITS_FROM_BASE="$(git rev-list --count "HEAD..origin/$BASE_BRANCH" 2>/dev/null || echo 0)"
+
+          case "$HEAD_BRANCH" in
+            main|staging|development)
+              IS_PROTECTED="true"
+              ;;
+            *)
+              IS_PROTECTED="false"
+              ;;
+          esac
+
+          NO_COMMITS_MESSAGE=""
+          if [ "$COMMITS_FROM_BASE" -eq 0 ]; then
+            echo "ℹ️ Nenhum commit pendente em $BASE_BRANCH para sincronizar com $HEAD_BRANCH."
+            NO_COMMITS_MESSAGE="ℹ️ Nenhum commit pendente no ramo base \`$BASE_BRANCH\` para sincronizar com \`$HEAD_BRANCH\`."
+          else
+            echo "🔄 Encontrados $COMMITS_FROM_BASE commit(s) em $BASE_BRANCH ainda não presentes em $HEAD_BRANCH."
+          fi
+
+          {
+            echo "commits_from_base=$COMMITS_FROM_BASE"
+            echo "is_protected=$IS_PROTECTED"
+            printf 'no_commits_message<<EOF\n%s\nEOF\n' "$NO_COMMITS_MESSAGE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sync protected branch via PR
+        id: sync-protected
+        if: ${{ steps.compute-sync.outputs.commits_from_base != '0' && steps.compute-sync.outputs.is_protected == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          COMMITS_FROM_BASE: ${{ steps.compute-sync.outputs.commits_from_base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GITHUB_API_URL="https://api.github.com"
 
           create_sync_pr() {
             local title="$1"
@@ -91,64 +120,142 @@ jobs:
               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/refs/heads/$branch" || true
           }
 
-          if [ "$COMMITS_FROM_BASE" -eq 0 ]; then
-            echo "ℹ️ Nenhum commit pendente em $BASE_BRANCH para sincronizar com $HEAD_BRANCH."
-            SYNC_COMMITS_MESSAGE="ℹ️ Nenhum commit pendente no ramo base \`$BASE_BRANCH\` para sincronizar com \`$HEAD_BRANCH\`."
+          TS="$(date -u +%Y%m%d-%H%M%S)"
+          SYNC_BRANCH="auto-sync/${HEAD_BRANCH}-from-${BASE_BRANCH}-${TS}"
+
+          echo "🔧 Branch protegido detectado ($HEAD_BRANCH). Criando branch de sincronização: $SYNC_BRANCH"
+
+          git checkout "$HEAD_BRANCH"
+          git checkout -b "$SYNC_BRANCH" "$HEAD_BRANCH"
+          git merge --no-ff "origin/$BASE_BRANCH" -m "chore: sync $HEAD_BRANCH with $BASE_BRANCH"
+
+          git push origin "$SYNC_BRANCH"
+
+          PR_TITLE="chore: sync $HEAD_BRANCH with $BASE_BRANCH"
+          PR_BODY="PR automática criada pelo workflow auto-sync para trazer \`$HEAD_BRANCH\` em linha com \`$BASE_BRANCH\`.\n\n- Commits a partir de \`$BASE_BRANCH\`: $COMMITS_FROM_BASE\n- Branch de sincronização: \`$SYNC_BRANCH\`"
+
+          PR_RESPONSE="$(create_sync_pr "$PR_TITLE" "$SYNC_BRANCH" "$HEAD_BRANCH" "$PR_BODY")"
+          SYNC_PR_NUMBER="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.number // ""')"
+          SYNC_PR_URL="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.html_url // ""')"
+
+          UPDATED_COMMITS="false"
+          SYNC_MODE="pr_error"
+          SYNC_COMMITS_MESSAGE=""
+
+          if [ -z "$SYNC_PR_NUMBER" ]; then
+            echo "❌ Falha ao criar PR de sincronização."
+            echo "$PR_RESPONSE"
+            UPDATED_COMMITS="false"
+            SYNC_MODE="pr_error"
+            SYNC_COMMITS_MESSAGE="❌ Não foi possível criar a PR de sincronização automática de \`$BASE_BRANCH\` para \`$HEAD_BRANCH\`. Verifique os logs do workflow."
           else
-            echo "🔄 Encontrados $COMMITS_FROM_BASE commit(s) em $BASE_BRANCH ainda não presentes em $HEAD_BRANCH."
+            MERGE_RESPONSE="$(merge_sync_pr "$SYNC_PR_NUMBER")"
+            MERGED="$(printf '%s\n' "$MERGE_RESPONSE" | jq -r '.merged // false')"
 
-            if [ "$HEAD_BRANCH" = "main" ] || [ "$HEAD_BRANCH" = "staging" ] || [ "$HEAD_BRANCH" = "development" ]; then
-              TS="$(date -u +%Y%m%d-%H%M%S)"
-              SYNC_BRANCH="auto-sync/${HEAD_BRANCH}-from-${BASE_BRANCH}-${TS}"
-
-              echo "🔧 Branch protegido detectado ($HEAD_BRANCH). Criando branch de sincronização: $SYNC_BRANCH"
-
-              git checkout -b "$SYNC_BRANCH" "$HEAD_BRANCH"
-              git merge --no-ff "origin/$BASE_BRANCH" -m "chore: sync $HEAD_BRANCH with $BASE_BRANCH"
-
-              git push origin "$SYNC_BRANCH"
-
-              PR_TITLE="chore: sync $HEAD_BRANCH with $BASE_BRANCH"
-              PR_BODY="PR automática criada pelo workflow auto-sync para trazer \`$HEAD_BRANCH\` em linha com \`$BASE_BRANCH\`.\n\n- Commits a partir de \`$BASE_BRANCH\`: $COMMITS_FROM_BASE\n- Branch de sincronização: \`$SYNC_BRANCH\`"
-
-              PR_RESPONSE="$(create_sync_pr "$PR_TITLE" "$SYNC_BRANCH" "$HEAD_BRANCH" "$PR_BODY")"
-
-              SYNC_PR_NUMBER="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.number // ""')"
-              SYNC_PR_URL="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.html_url // ""')"
-
-              if [ -z "$SYNC_PR_NUMBER" ]; then
-                echo "❌ Falha ao criar PR de sincronização."
-                echo "$PR_RESPONSE"
-                SYNC_MODE="pr_error"
-                UPDATED_COMMITS="false"
-                SYNC_COMMITS_MESSAGE="❌ Não foi possível criar a PR de sincronização automática de \`$BASE_BRANCH\` para \`$HEAD_BRANCH\`. Verifique os logs do workflow."
-              else
-                MERGE_RESPONSE="$(merge_sync_pr "$SYNC_PR_NUMBER")"
-                MERGED="$(printf '%s\n' "$MERGE_RESPONSE" | jq -r '.merged // false')"
-
-                if [ "$MERGED" != "true" ]; then
-                  echo "❌ Falha ao mesclar PR de sincronização: $SYNC_PR_URL"
-                  echo "$MERGE_RESPONSE"
-                  SYNC_MODE="pr_open"
-                  UPDATED_COMMITS="false"
-                  SYNC_COMMITS_MESSAGE="⚠️ Foram encontrados $COMMITS_FROM_BASE commit(s) em \`$BASE_BRANCH\` ainda não presentes em \`$HEAD_BRANCH\`, mas não foi possível mesclar automaticamente a PR de sincronização ($SYNC_PR_URL). Verifique a PR e conclua manualmente."
-                else
-                  echo "✅ PR de sincronização mesclada com sucesso: $SYNC_PR_URL"
-
-                  delete_sync_branch_ref "$SYNC_BRANCH"
-
-                  SYNC_MODE="pr_merged"
-                  UPDATED_COMMITS="true"
-                  SYNC_COMMITS_MESSAGE="🔄 O ramo \`$HEAD_BRANCH\` foi atualizado automaticamente com $COMMITS_FROM_BASE commit(s) de \`$BASE_BRANCH\` via PR de sincronização ($SYNC_PR_URL)."
-                fi
-              fi
+            if [ "$MERGED" != "true" ]; then
+              echo "❌ Falha ao mesclar PR de sincronização: $SYNC_PR_URL"
+              echo "$MERGE_RESPONSE"
+              UPDATED_COMMITS="false"
+              SYNC_MODE="pr_open"
+              SYNC_COMMITS_MESSAGE="⚠️ Foram encontrados $COMMITS_FROM_BASE commit(s) em \`$BASE_BRANCH\` ainda não presentes em \`$HEAD_BRANCH\`, mas não foi possível mesclar automaticamente a PR de sincronização ($SYNC_PR_URL). Verifique a PR e conclua manualmente."
             else
-              git merge --no-ff "origin/$BASE_BRANCH" -m "chore: sync $HEAD_BRANCH with $BASE_BRANCH"
-              git push origin "HEAD:$HEAD_BRANCH"
-
+              echo "✅ PR de sincronização mesclada com sucesso: $SYNC_PR_URL"
+              delete_sync_branch_ref "$SYNC_BRANCH"
               UPDATED_COMMITS="true"
-              SYNC_MODE="direct"
-              SYNC_COMMITS_MESSAGE="🔄 O ramo \`$HEAD_BRANCH\` foi atualizado com $COMMITS_FROM_BASE commit(s) do ramo base \`$BASE_BRANCH\`."
+              SYNC_MODE="pr_merged"
+              SYNC_COMMITS_MESSAGE="🔄 O ramo \`$HEAD_BRANCH\` foi atualizado automaticamente com $COMMITS_FROM_BASE commit(s) de \`$BASE_BRANCH\` via PR de sincronização ($SYNC_PR_URL)."
+            fi
+          fi
+
+          {
+            echo "updated_commits=$UPDATED_COMMITS"
+            echo "sync_mode=$SYNC_MODE"
+            echo "sync_pr_url=$SYNC_PR_URL"
+            echo "sync_pr_number=$SYNC_PR_NUMBER"
+            echo "sync_branch=$SYNC_BRANCH"
+            printf 'message_commits<<EOF\n%s\nEOF\n' "$SYNC_COMMITS_MESSAGE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sync non-protected branch directly
+        id: sync-direct
+        if: ${{ steps.compute-sync.outputs.commits_from_base != '0' && steps.compute-sync.outputs.is_protected != 'true' }}
+        env:
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          COMMITS_FROM_BASE: ${{ steps.compute-sync.outputs.commits_from_base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git checkout "$HEAD_BRANCH"
+          git merge --no-ff "origin/$BASE_BRANCH" -m "chore: sync $HEAD_BRANCH with $BASE_BRANCH"
+          git push origin "HEAD:$HEAD_BRANCH"
+
+          UPDATED_COMMITS="true"
+          SYNC_MODE="direct"
+          SYNC_PR_URL=""
+          SYNC_PR_NUMBER=""
+          SYNC_BRANCH=""
+          SYNC_COMMITS_MESSAGE="🔄 O ramo \`$HEAD_BRANCH\` foi atualizado com $COMMITS_FROM_BASE commit(s) do ramo base \`$BASE_BRANCH\`."
+
+          {
+            echo "updated_commits=$UPDATED_COMMITS"
+            echo "sync_mode=$SYNC_MODE"
+            echo "sync_pr_url=$SYNC_PR_URL"
+            echo "sync_pr_number=$SYNC_PR_NUMBER"
+            echo "sync_branch=$SYNC_BRANCH"
+            printf 'message_commits<<EOF\n%s\nEOF\n' "$SYNC_COMMITS_MESSAGE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Aggregate sync results
+        id: sync-commits
+        env:
+          COMMITS_FROM_BASE: ${{ steps.compute-sync.outputs.commits_from_base }}
+          NO_COMMITS_MESSAGE: ${{ steps.compute-sync.outputs.no_commits_message }}
+
+          PROT_UPDATED: ${{ steps.sync-protected.outputs.updated_commits }}
+          PROT_MODE: ${{ steps.sync-protected.outputs.sync_mode }}
+          PROT_URL: ${{ steps.sync-protected.outputs.sync_pr_url }}
+          PROT_NUM: ${{ steps.sync-protected.outputs.sync_pr_number }}
+          PROT_BRANCH: ${{ steps.sync-protected.outputs.sync_branch }}
+          PROT_MSG: ${{ steps.sync-protected.outputs.message_commits }}
+
+          DIR_UPDATED: ${{ steps.sync-direct.outputs.updated_commits }}
+          DIR_MODE: ${{ steps.sync-direct.outputs.sync_mode }}
+          DIR_URL: ${{ steps.sync-direct.outputs.sync_pr_url }}
+          DIR_NUM: ${{ steps.sync-direct.outputs.sync_pr_number }}
+          DIR_BRANCH: ${{ steps.sync-direct.outputs.sync_branch }}
+          DIR_MSG: ${{ steps.sync-direct.outputs.message_commits }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UPDATED_COMMITS="false"
+          SYNC_MODE="none"
+          SYNC_PR_URL=""
+          SYNC_PR_NUMBER=""
+          SYNC_BRANCH=""
+          SYNC_COMMITS_MESSAGE=""
+
+          if [ "${COMMITS_FROM_BASE:-0}" = "0" ]; then
+            UPDATED_COMMITS="false"
+            SYNC_MODE="none"
+            SYNC_COMMITS_MESSAGE="${NO_COMMITS_MESSAGE:-""}"
+          else
+            if [ -n "${PROT_MODE:-}" ]; then
+              UPDATED_COMMITS="${PROT_UPDATED:-false}"
+              SYNC_MODE="${PROT_MODE:-none}"
+              SYNC_PR_URL="${PROT_URL:-}"
+              SYNC_PR_NUMBER="${PROT_NUM:-}"
+              SYNC_BRANCH="${PROT_BRANCH:-}"
+              SYNC_COMMITS_MESSAGE="${PROT_MSG:-}"
+            elif [ -n "${DIR_MODE:-}" ]; then
+              UPDATED_COMMITS="${DIR_UPDATED:-false}"
+              SYNC_MODE="${DIR_MODE:-none}"
+              SYNC_PR_URL="${DIR_URL:-}"
+              SYNC_PR_NUMBER="${DIR_NUM:-}"
+              SYNC_BRANCH="${DIR_BRANCH:-}"
+              SYNC_COMMITS_MESSAGE="${DIR_MSG:-}"
             fi
           fi
 
@@ -166,6 +273,7 @@ jobs:
         env:
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        shell: bash
         run: |
           #!/usr/bin/env bash
           set -euo pipefail
@@ -193,7 +301,7 @@ jobs:
             printf 'message_diff<<EOF\n%s\nEOF\n' "$DIFF_MESSAGE"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Branch protection checklist
+      - name: Branch protection checklist (comment dedicado)
         id: repo-settings
         uses: Malnati/check-permissions@v1
         with:
