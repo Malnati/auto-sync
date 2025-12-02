@@ -32,6 +32,7 @@ jobs:
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           #!/usr/bin/env bash
+          set -euo pipefail
 
           GITHUB_API_URL="https://api.github.com"
 
@@ -46,8 +47,49 @@ jobs:
           SYNC_PR_URL=""
           SYNC_PR_NUMBER=""
           SYNC_BRANCH=""
+          SYNC_COMMITS_MESSAGE=""
 
           COMMITS_FROM_BASE="$(git rev-list --count "HEAD..origin/$BASE_BRANCH" 2>/dev/null || echo 0)"
+
+          create_sync_pr() {
+            local title="$1"
+            local head="$2"
+            local base="$3"
+            local body="$4"
+
+            jq -n \
+              --arg title "$title" \
+              --arg head "$head" \
+              --arg base "$base" \
+              --arg body "$body" \
+              '{title:$title, head:$head, base:$base, body:$body}' |
+              curl -sS \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -X POST "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls" \
+                -d @-
+          }
+
+          merge_sync_pr() {
+            local pr_number="$1"
+
+            curl -sS \
+              -X PUT \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$pr_number/merge" \
+              -d '{"merge_method":"squash"}'
+          }
+
+          delete_sync_branch_ref() {
+            local branch="$1"
+
+            curl -sS \
+              -X DELETE \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/refs/heads/$branch" || true
+          }
 
           if [ "$COMMITS_FROM_BASE" -eq 0 ]; then
             echo "ℹ️ Nenhum commit pendente em $BASE_BRANCH para sincronizar com $HEAD_BRANCH."
@@ -69,22 +111,10 @@ jobs:
               PR_TITLE="chore: sync $HEAD_BRANCH with $BASE_BRANCH"
               PR_BODY="PR automática criada pelo workflow auto-sync para trazer \`$HEAD_BRANCH\` em linha com \`$BASE_BRANCH\`.\n\n- Commits a partir de \`$BASE_BRANCH\`: $COMMITS_FROM_BASE\n- Branch de sincronização: \`$SYNC_BRANCH\`"
 
-              PR_RESPONSE="$(
-                printf '{
-                  "title": "%s",
-                  "head": "%s",
-                  "base": "%s",
-                  "body": "%s"
-                }' "$PR_TITLE" "$SYNC_BRANCH" "$HEAD_BRANCH" "$PR_BODY" \
-                | curl -sS \
-                    -H "Authorization: Bearer $GITHUB_TOKEN" \
-                    -H "Accept: application/vnd.github+json" \
-                    -X POST "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls" \
-                    -d @-
-              )"
+              PR_RESPONSE="$(create_sync_pr "$PR_TITLE" "$SYNC_BRANCH" "$HEAD_BRANCH" "$PR_BODY")"
 
-              SYNC_PR_NUMBER="$(printf '%s' "$PR_RESPONSE" | python -c 'import sys, json; data=json.load(sys.stdin); print(data.get("number", ""))')"
-              SYNC_PR_URL="$(printf '%s' "$PR_RESPONSE" | python -c 'import sys, json; data=json.load(sys.stdin); print(data.get("html_url", ""))')"
+              SYNC_PR_NUMBER="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.number // ""')"
+              SYNC_PR_URL="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.html_url // ""')"
 
               if [ -z "$SYNC_PR_NUMBER" ]; then
                 echo "❌ Falha ao criar PR de sincronização."
@@ -93,18 +123,10 @@ jobs:
                 UPDATED_COMMITS="false"
                 SYNC_COMMITS_MESSAGE="❌ Não foi possível criar a PR de sincronização automática de \`$BASE_BRANCH\` para \`$HEAD_BRANCH\`. Verifique os logs do workflow."
               else
-                MERGE_RESPONSE="$(
-                  curl -sS \
-                    -X PUT \
-                    -H "Authorization: Bearer $GITHUB_TOKEN" \
-                    -H "Accept: application/vnd.github+json" \
-                    "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$SYNC_PR_NUMBER/merge" \
-                    -d '{"merge_method":"squash"}'
-                )"
+                MERGE_RESPONSE="$(merge_sync_pr "$SYNC_PR_NUMBER")"
+                MERGED="$(printf '%s\n' "$MERGE_RESPONSE" | jq -r '.merged // false')"
 
-                MERGED="$(printf '%s' "$MERGE_RESPONSE" | python -c 'import sys, json; data=json.load(sys.stdin); print(data.get("merged", False))')"
-
-                if [ "$MERGED" != "True" ] && [ "$MERGED" != "true" ]; then
+                if [ "$MERGED" != "true" ]; then
                   echo "❌ Falha ao mesclar PR de sincronização: $SYNC_PR_URL"
                   echo "$MERGE_RESPONSE"
                   SYNC_MODE="pr_open"
@@ -113,11 +135,7 @@ jobs:
                 else
                   echo "✅ PR de sincronização mesclada com sucesso: $SYNC_PR_URL"
 
-                  curl -sS \
-                    -X DELETE \
-                    -H "Authorization: Bearer $GITHUB_TOKEN" \
-                    -H "Accept: application/vnd.github+json" \
-                    "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/refs/heads/$SYNC_BRANCH" || true
+                  delete_sync_branch_ref "$SYNC_BRANCH"
 
                   SYNC_MODE="pr_merged"
                   UPDATED_COMMITS="true"
@@ -143,8 +161,6 @@ jobs:
             printf 'message_commits<<EOF\n%s\nEOF\n' "$SYNC_COMMITS_MESSAGE"
           } >> "$GITHUB_OUTPUT"
 
-          exit 0
-
       - name: Check file diff between head and base branch
         id: diff-status
         env:
@@ -152,6 +168,7 @@ jobs:
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           #!/usr/bin/env bash
+          set -euo pipefail
 
           git fetch origin "$BASE_BRANCH" "$HEAD_BRANCH"
 
@@ -176,162 +193,21 @@ jobs:
             printf 'message_diff<<EOF\n%s\nEOF\n' "$DIFF_MESSAGE"
           } >> "$GITHUB_OUTPUT"
 
-          exit 0
-
-      - name: Collect repository merge settings and branch protection
+      - name: Branch protection checklist
         id: repo-settings
+        uses: Malnati/check-permissions@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base_branch: ${{ github.event.pull_request.base.ref }}
+          pr_number: ${{ github.event.pull_request.number }}
+
+      - name: Build PR comment message
+        id: build-pr-message
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
-        run: |
-          set -euo pipefail
-
-          GITHUB_API_URL="https://api.github.com"
-
-          REPO_RESPONSE="$(curl -sS \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY")"
-
-          TMP_PROTECTION="$(mktemp)"
-
-          BRANCH_PROT_STATUS="$(curl -sS \
-            -o "$TMP_PROTECTION" \
-            -w '%{http_code}' \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/branches/$BASE_BRANCH/protection")"
-
-          PROTECTION_RESPONSE="$(cat "$TMP_PROTECTION" || echo '')"
-          rm -f "$TMP_PROTECTION" || true
-
-          export REPO_JSON="$REPO_RESPONSE"
-          export PROTECTION_JSON="$PROTECTION_RESPONSE"
-          export BRANCH_PROT_STATUS
-          export BASE_BRANCH
-          export GITHUB_OUTPUT
-
-          python - << 'PY'
-          import json
-          import os
-
-          def emoji(val):
-              if val is True:
-                  return "✅"
-              if val is False:
-                  return "❌"
-              if val is None:
-                  return "❔"
-              return "✅" if val else "❌"
-
-          repo_raw = os.environ.get("REPO_JSON", "") or "{}"
-          prot_raw = os.environ.get("PROTECTION_JSON", "") or "{}"
-          status = os.environ.get("BRANCH_PROT_STATUS", "")
-          base_branch = os.environ.get("BASE_BRANCH", "")
-
-          try:
-              repo = json.loads(repo_raw)
-          except Exception:
-              repo = {}
-
-          allow_rebase = repo.get("allow_rebase_merge")
-          allow_squash = repo.get("allow_squash_merge")
-          allow_merge_commit = repo.get("allow_merge_commit")
-          allow_auto_merge = repo.get("allow_auto_merge")
-          delete_branch_on_merge = repo.get("delete_branch_on_merge")
-          default_branch = repo.get("default_branch")
-
-          linear_history = None
-          required_status = None
-          strict_status = None
-          required_approving = None
-          enforce_admins = None
-          restrictions = None
-
-          if status == "200":
-              try:
-                  prot = json.loads(prot_raw)
-              except Exception:
-                  prot = {}
-              else:
-                  linear = prot.get("required_linear_history")
-                  if isinstance(linear, dict):
-                      linear_history = linear.get("enabled")
-                  elif isinstance(linear, bool):
-                      linear_history = linear
-
-                  rs = prot.get("required_status_checks")
-                  if isinstance(rs, dict):
-                      checks = rs.get("checks")
-                      contexts = rs.get("contexts")
-                      required_status = bool(checks or contexts)
-                      strict_status = rs.get("strict")
-
-                  rpr = prot.get("required_pull_request_reviews")
-                  if isinstance(rpr, dict):
-                      required_approving = rpr.get("required_approving_review_count")
-
-                  ea = prot.get("enforce_admins")
-                  if isinstance(ea, dict):
-                      enforce_admins = ea.get("enabled")
-                  elif isinstance(ea, bool):
-                      enforce_admins = ea
-
-                  rest = prot.get("restrictions")
-                  if isinstance(rest, dict):
-                      restrictions = bool(
-                          rest.get("users") or rest.get("teams") or rest.get("apps")
-                      )
-
-          lines = []
-          lines.append("📋 Lista de checagem de merge e proteção de branch:")
-          lines.append("")
-          lines.append("**Configuração de merge do repositório:**")
-          lines.append(f"- Rebase merge habilitado: {emoji(allow_rebase)}")
-          lines.append(f"- Squash merge habilitado: {emoji(allow_squash)}")
-          lines.append(f"- Merge commit habilitado: {emoji(allow_merge_commit)}")
-          lines.append(f"- Auto-merge habilitado: {emoji(allow_auto_merge)}")
-          lines.append(f"- Deletar branch no merge: {emoji(delete_branch_on_merge)}")
-          if default_branch:
-              lines.append(f"- Branch padrão do repositório: `{default_branch}`")
-
-          if status == "200":
-              lines.append("")
-              lines.append(f"**Proteção do branch base `{base_branch}`:**")
-              lines.append(f"- Histórico linear obrigatório: {emoji(linear_history)}")
-              if required_status is not None:
-                  lines.append(f"- Status checks obrigatórios: {emoji(required_status)}")
-                  if strict_status is not None:
-                      lines.append(f"  - Exigir branch atualizado para merge: {emoji(strict_status)}")
-              if required_approving is not None:
-                  count = required_approving or 0
-                  lines.append(f"- Reviews obrigatórios: {count} aprovação(ões)")
-              if enforce_admins is not None:
-                  lines.append(f"- Regras válidas também para admins: {emoji(enforce_admins)}")
-              if restrictions is not None:
-                  lines.append(f"- Restrição de quem pode pushar: {emoji(restrictions)}")
-          else:
-              lines.append("")
-              lines.append(f"⚠️ Não foi possível ler a proteção do branch `{base_branch}` (status HTTP {status}).")
-
-          msg = "\n".join(lines)
-
-          github_output = os.environ.get("GITHUB_OUTPUT")
-          if github_output:
-              with open(github_output, "a", encoding="utf-8") as fh:
-                  fh.write("message_checklist<<EOF\n")
-                  fh.write(msg)
-                  fh.write("\nEOF\n")
-          else:
-              print(msg)
-          PY
-
-      - name: Comment sync and changed files status
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
           CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
           SYNC_COMMITS_MESSAGE: ${{ steps.sync-commits.outputs.message_commits }}
           DIFF_MESSAGE: ${{ steps.diff-status.outputs.message_diff }}
@@ -339,33 +215,57 @@ jobs:
         run: |
           set -euo pipefail
 
-          MSG=""
+          HEADER_ACTOR="${GITHUB_ACTOR}"
+          HEADER_TITLE="🔁 auto-sync"
+          HEADER_SUBJECT="Sincronização de ${BASE_BRANCH} → ${HEAD_BRANCH}"
+
+          BODY_MESSAGE=""
 
           if [ -n "${SYNC_COMMITS_MESSAGE:-}" ]; then
-            MSG+="$SYNC_COMMITS_MESSAGE\n\n"
+            BODY_MESSAGE+="${SYNC_COMMITS_MESSAGE}\n\n"
           fi
 
           if [ -n "${DIFF_MESSAGE:-}" ]; then
-            MSG+="$DIFF_MESSAGE\n\n"
+            BODY_MESSAGE+="${DIFF_MESSAGE}\n\n"
           fi
 
           if [ -n "${CHECKLIST_MESSAGE:-}" ]; then
-            MSG+="$CHECKLIST_MESSAGE\n\n"
+            BODY_MESSAGE+="${CHECKLIST_MESSAGE}\n\n"
           fi
 
           if [ "${CHANGED_FILES:-0}" -gt 0 ]; then
-            MSG+="✅ Esta Pull Request contém $CHANGED_FILES arquivo(s) alterado(s).\n"
-            MSG+="🧾 O fluxo de validação continuará normalmente.\n"
+            BODY_SCOPE="- Arquivos alterados: ${CHANGED_FILES}"
+            FOOTER_RESULT="Esta Pull Request contém ${CHANGED_FILES} arquivo(s) alterado(s)."
+            FOOTER_ADVISE="O fluxo de validação continuará normalmente."
           else
-            MSG+="ℹ️ Esta Pull Request não possui arquivos alterados (changed_files = ${CHANGED_FILES:-0}).\n"
+            BODY_SCOPE="- Nenhum arquivo alterado (changed_files = ${CHANGED_FILES:-0})."
+            FOOTER_RESULT="Pull Request sem arquivos alterados."
+            FOOTER_ADVISE="Verifique se isso é esperado antes de prosseguir com o merge."
           fi
 
-          JSON_BODY="$(printf '%b' "$MSG" | jq -Rs '{body: .}')"
+          BODY_TODO=""
 
-          curl -sS \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -X POST "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
-            -d "$JSON_BODY" || true
+          {
+            echo "header_actor=${HEADER_ACTOR}"
+            echo "header_title=${HEADER_TITLE}"
+            echo "header_subject=${HEADER_SUBJECT}"
+            printf 'body_message<<EOF\n%s\nEOF\n' "${BODY_MESSAGE}"
+            printf 'body_scope<<EOF\n%s\nEOF\n' "${BODY_SCOPE}"
+            printf 'body_todo<<EOF\n%s\nEOF\n' "${BODY_TODO}"
+            echo "footer_result=${FOOTER_RESULT}"
+            echo "footer_advise=${FOOTER_ADVISE}"
+          } >> "$GITHUB_OUTPUT"
 
-          exit 0
+      - name: Comment sync and changed files status
+        uses: Malnati/pr-comment@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pr_number: ${{ github.event.pull_request.number }}
+          header_actor: ${{ steps.build-pr-message.outputs.header_actor }}
+          header_title: ${{ steps.build-pr-message.outputs.header_title }}
+          header_subject: ${{ steps.build-pr-message.outputs.header_subject }}
+          body_message: ${{ steps.build-pr-message.outputs.body_message }}
+          body_scope: ${{ steps.build-pr-message.outputs.body_scope }}
+          body_todo: ${{ steps.build-pr-message.outputs.body_todo }}
+          footer_result: ${{ steps.build-pr-message.outputs.footer_result }}
+          footer_advise: ${{ steps.build-pr-message.outputs.footer_advise }}
