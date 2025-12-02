@@ -1,5 +1,5 @@
 # action.yml
-name: "🔁 auto-sync"
+name: "Auto sync undeletable branches"
 
 on:
   workflow_call:
