@@ -31,6 +31,8 @@ jobs:
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
+          #!/usr/bin/env bash
+
           GITHUB_API_URL="https://api.github.com"
 
           git fetch origin "$BASE_BRANCH" "$HEAD_BRANCH"
@@ -149,6 +151,8 @@ jobs:
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
+          #!/usr/bin/env bash
+
           git fetch origin "$BASE_BRANCH" "$HEAD_BRANCH"
 
           git checkout "$HEAD_BRANCH"
@@ -181,6 +185,8 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
         run: |
+          #!/usr/bin/env bash
+
           GITHUB_API_URL="https://api.github.com"
 
           REPO_RESPONSE="$(curl -sS \
@@ -328,6 +334,8 @@ PY
           DIFF_MESSAGE: ${{ steps.diff-status.outputs.message_diff }}
           CHECKLIST_MESSAGE: ${{ steps.repo-settings.outputs.message_checklist }}
         run: |
+          #!/usr/bin/env bash
+
           MSG=""
 
           if [ -n "${SYNC_COMMITS_MESSAGE:-}" ]; then
