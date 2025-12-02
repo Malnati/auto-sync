@@ -97,7 +97,7 @@ jobs:
                     -H "Authorization: Bearer $GITHUB_TOKEN" \
                     -H "Accept: application/vnd.github+json" \
                     "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$SYNC_PR_NUMBER/merge" \
-                    -d '{"merge_method":"rebase"}'
+                    -d '{"merge_method":"merge"}'
                 )"
 
                 MERGED="$(printf '%s' "$MERGE_RESPONSE" | python -c 'import sys, json; data=json.load(sys.stdin); print(data.get("merged", False))')"
