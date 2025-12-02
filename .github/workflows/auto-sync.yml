@@ -185,7 +185,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
         run: |
-          #!/usr/bin/env bash
+          set -euo pipefail
 
           GITHUB_API_URL="https://api.github.com"
 
@@ -210,119 +210,122 @@ jobs:
           export PROTECTION_JSON="$PROTECTION_RESPONSE"
           export BRANCH_PROT_STATUS
           export BASE_BRANCH
+          export GITHUB_OUTPUT
 
-          CHECKLIST_MESSAGE="$(python - << 'PY'
-import json, os
+          python - << 'PY'
+          import json
+          import os
 
-def emoji(val):
-    if val is True:
-        return "✅"
-    if val is False:
-        return "❌"
-    if val is None:
-        return "❔"
-    return "✅" if val else "❌"
+          def emoji(val):
+              if val is True:
+                  return "✅"
+              if val is False:
+                  return "❌"
+              if val is None:
+                  return "❔"
+              return "✅" if val else "❌"
 
-repo_raw = os.environ.get("REPO_JSON","") or "{}"
-prot_raw = os.environ.get("PROTECTION_JSON","") or "{}"
-status = os.environ.get("BRANCH_PROT_STATUS","")
+          repo_raw = os.environ.get("REPO_JSON", "") or "{}"
+          prot_raw = os.environ.get("PROTECTION_JSON", "") or "{}"
+          status = os.environ.get("BRANCH_PROT_STATUS", "")
+          base_branch = os.environ.get("BASE_BRANCH", "")
 
-try:
-    repo = json.loads(repo_raw)
-except Exception:
-    repo = {}
+          try:
+              repo = json.loads(repo_raw)
+          except Exception:
+              repo = {}
 
-allow_rebase = repo.get("allow_rebase_merge")
-allow_squash = repo.get("allow_squash_merge")
-allow_merge_commit = repo.get("allow_merge_commit")
-allow_auto_merge = repo.get("allow_auto_merge")
-delete_branch_on_merge = repo.get("delete_branch_on_merge")
-default_branch = repo.get("default_branch")
+          allow_rebase = repo.get("allow_rebase_merge")
+          allow_squash = repo.get("allow_squash_merge")
+          allow_merge_commit = repo.get("allow_merge_commit")
+          allow_auto_merge = repo.get("allow_auto_merge")
+          delete_branch_on_merge = repo.get("delete_branch_on_merge")
+          default_branch = repo.get("default_branch")
 
-linear_history = None
-required_status = None
-strict_status = None
-required_approving = None
-enforce_admins = None
-restrictions = None
+          linear_history = None
+          required_status = None
+          strict_status = None
+          required_approving = None
+          enforce_admins = None
+          restrictions = None
 
-if status == "200":
-    try:
-        prot = json.loads(prot_raw)
-    except Exception:
-        prot = {}
-    else:
-        linear = prot.get("required_linear_history")
-        if isinstance(linear, dict):
-            linear_history = linear.get("enabled")
-        elif isinstance(linear, bool):
-            linear_history = linear
+          if status == "200":
+              try:
+                  prot = json.loads(prot_raw)
+              except Exception:
+                  prot = {}
+              else:
+                  linear = prot.get("required_linear_history")
+                  if isinstance(linear, dict):
+                      linear_history = linear.get("enabled")
+                  elif isinstance(linear, bool):
+                      linear_history = linear
 
-        rs = prot.get("required_status_checks")
-        if isinstance(rs, dict):
-            checks = rs.get("checks")
-            contexts = rs.get("contexts")
-            required_status = bool(checks or contexts)
-            strict_status = rs.get("strict")
+                  rs = prot.get("required_status_checks")
+                  if isinstance(rs, dict):
+                      checks = rs.get("checks")
+                      contexts = rs.get("contexts")
+                      required_status = bool(checks or contexts)
+                      strict_status = rs.get("strict")
 
-        rpr = prot.get("required_pull_request_reviews")
-        if isinstance(rpr, dict):
-            required_approving = rpr.get("required_approving_review_count")
+                  rpr = prot.get("required_pull_request_reviews")
+                  if isinstance(rpr, dict):
+                      required_approving = rpr.get("required_approving_review_count")
 
-        ea = prot.get("enforce_admins")
-        if isinstance(ea, dict):
-            enforce_admins = ea.get("enabled")
-        elif isinstance(ea, bool):
-            enforce_admins = ea
+                  ea = prot.get("enforce_admins")
+                  if isinstance(ea, dict):
+                      enforce_admins = ea.get("enabled")
+                  elif isinstance(ea, bool):
+                      enforce_admins = ea
 
-        rest = prot.get("restrictions")
-        if isinstance(rest, dict):
-            restrictions = bool(
-                rest.get("users") or rest.get("teams") or rest.get("apps")
-            )
+                  rest = prot.get("restrictions")
+                  if isinstance(rest, dict):
+                      restrictions = bool(
+                          rest.get("users") or rest.get("teams") or rest.get("apps")
+                      )
 
-lines = []
-lines.append("📋 Lista de checagem de merge e proteção de branch:")
-lines.append("")
-lines.append("**Configuração de merge do repositório:**")
-lines.append(f"- Rebase merge habilitado: {emoji(allow_rebase)}")
-lines.append(f"- Squash merge habilitado: {emoji(allow_squash)}")
-lines.append(f"- Merge commit habilitado: {emoji(allow_merge_commit)}")
-lines.append(f"- Auto-merge habilitado: {emoji(allow_auto_merge)}")
-lines.append(f"- Deletar branch no merge: {emoji(delete_branch_on_merge)}")
-if default_branch:
-    lines.append(f"- Branch padrão do repositório: `{default_branch}`")
+          lines = []
+          lines.append("📋 Lista de checagem de merge e proteção de branch:")
+          lines.append("")
+          lines.append("**Configuração de merge do repositório:**")
+          lines.append(f"- Rebase merge habilitado: {emoji(allow_rebase)}")
+          lines.append(f"- Squash merge habilitado: {emoji(allow_squash)}")
+          lines.append(f"- Merge commit habilitado: {emoji(allow_merge_commit)}")
+          lines.append(f"- Auto-merge habilitado: {emoji(allow_auto_merge)}")
+          lines.append(f"- Deletar branch no merge: {emoji(delete_branch_on_merge)}")
+          if default_branch:
+              lines.append(f"- Branch padrão do repositório: `{default_branch}`")
 
-base_branch = os.environ.get("BASE_BRANCH","")
+          if status == "200":
+              lines.append("")
+              lines.append(f"**Proteção do branch base `{base_branch}`:**")
+              lines.append(f"- Histórico linear obrigatório: {emoji(linear_history)}")
+              if required_status is not None:
+                  lines.append(f"- Status checks obrigatórios: {emoji(required_status)}")
+                  if strict_status is not None:
+                      lines.append(f"  - Exigir branch atualizado para merge: {emoji(strict_status)}")
+              if required_approving is not None:
+                  count = required_approving or 0
+                  lines.append(f"- Reviews obrigatórios: {count} aprovação(ões)")
+              if enforce_admins is not None:
+                  lines.append(f"- Regras válidas também para admins: {emoji(enforce_admins)}")
+              if restrictions is not None:
+                  lines.append(f"- Restrição de quem pode pushar: {emoji(restrictions)}")
+          else:
+              lines.append("")
+              lines.append(f"⚠️ Não foi possível ler a proteção do branch `{base_branch}` (status HTTP {status}).")
 
-if status == "200":
-    lines.append("")
-    lines.append(f"**Proteção do branch base `{base_branch}`:**")
-    lines.append(f"- Histórico linear obrigatório: {emoji(linear_history)}")
-    if required_status is not None:
-        lines.append(f"- Status checks obrigatórios: {emoji(required_status)}")
-        if strict_status is not None:
-            lines.append(f"  - Exigir branch atualizado para merge: {emoji(strict_status)}")
-    if required_approving is not None:
-        count = required_approving or 0
-        lines.append(f"- Reviews obrigatórios: {count} aprovação(ões)")
-    if enforce_admins is not None:
-        lines.append(f"- Regras válidas também para admins: {emoji(enforce_admins)}")
-    if restrictions is not None:
-        lines.append(f"- Restrição de quem pode pushar: {emoji(restrictions)}")
-else:
-    lines.append("")
-    lines.append(f"⚠️ Não foi possível ler a proteção do branch `{base_branch}` (status HTTP {status}).")
+          msg = "\n".join(lines)
 
-print("\n".join(lines))
-PY
-)"
-
-          {
-            printf 'message_checklist<<EOF\n%s\nEOF\n' "$CHECKLIST_MESSAGE"
-          } >> "$GITHUB_OUTPUT"
-
-          exit 0
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if github_output:
+              with open(github_output, "a", encoding="utf-8") as fh:
+                  fh.write("message_checklist<<EOF\n")
+                  fh.write(msg)
+                  fh.write("\nEOF\n")
+          else:
+              print(msg)
+          PY
 
       - name: Comment sync and changed files status
         env:
@@ -334,7 +337,7 @@ PY
           DIFF_MESSAGE: ${{ steps.diff-status.outputs.message_diff }}
           CHECKLIST_MESSAGE: ${{ steps.repo-settings.outputs.message_checklist }}
         run: |
-          #!/usr/bin/env bash
+          set -euo pipefail
 
           MSG=""
 
@@ -357,14 +360,7 @@ PY
             MSG+="ℹ️ Esta Pull Request não possui arquivos alterados (changed_files = ${CHANGED_FILES:-0}).\n"
           fi
 
-          export PR_COMMENT_BODY="$MSG"
-
-          JSON_BODY="$(python - << 'PY'
-import json, os
-body = os.environ.get("PR_COMMENT_BODY","")
-print(json.dumps({"body": body}))
-PY
-)"
+          JSON_BODY="$(printf '%b' "$MSG" | jq -Rs '{body: .}')"
 
           curl -sS \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
