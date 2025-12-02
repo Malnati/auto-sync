@@ -1,4 +1,4 @@
-# .github/workflows/auto-sync.yml
+# action.yml
 name: "🔁 auto-sync"
 
 on:
