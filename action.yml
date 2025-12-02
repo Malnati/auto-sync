@@ -1,184 +1,224 @@
 # action.yml
 name: "Auto sync undeletable branches"
+description: "Automatically sync protected branches via PR and merge base changes into non-protected branches."
+branding:
+  icon: "git-merge"
+  color: "purple"
 
-on:
-  workflow_call:
+inputs:
+  token:
+    description: "GitHub token with contents and pull-requests write permissions."
+    required: true
+  approach:
+    description: "Merge strategy to use when merging sync PRs (squash, merge, rebase)."
+    required: false
+    default: "squash"
 
-permissions:
-  contents: write
-  pull-requests: write
+outputs:
+  updated_commits:
+    description: "Indica se commits do branch base foram aplicados no branch alvo."
+    value: ${{ steps.sync-commits.outputs.updated_commits }}
+  sync_mode:
+    description: "Modo de sincronização utilizado: pr_merged, pr_error, direct ou none."
+    value: ${{ steps.sync-commits.outputs.sync_mode }}
+  sync_pr_url:
+    description: "URL do PR de sincronização, quando existir."
+    value: ${{ steps.sync-commits.outputs.sync_pr_url }}
 
-env:
-  APPROACH: "squash"
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout PR head branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.ref }}
+        fetch-depth: 0
 
-jobs:
-  check-changed-files:
-    runs-on: ubuntu-latest
-    outputs:
-      updated_commits: ${{ steps.sync-commits.outputs.updated_commits }}
-      sync_mode: ${{ steps.sync-commits.outputs.sync_mode }}
-      sync_pr_url: ${{ steps.sync-commits.outputs.sync_pr_url }}
+    - name: Compute sync metadata
+      id: compute-sync
+      shell: bash
+      env:
+        APPROACH: ${{ inputs.approach }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+      run: |
+        set -euo pipefail
+        git fetch origin "$BASE_BRANCH" "$HEAD_BRANCH"
+        git checkout "$HEAD_BRANCH"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        COMMITS_FROM_BASE="$(git rev-list --count "HEAD..origin/$BASE_BRANCH" 2>/dev/null || echo 0)"
+        case "$HEAD_BRANCH" in
+          main|staging|development)
+            IS_PROTECTED="true"
+            ;;
+          *)
+            IS_PROTECTED="false"
+            ;;
+        esac
+        NO_COMMITS_MESSAGE=""
+        if [ "$COMMITS_FROM_BASE" -eq 0 ]; then
+          NO_COMMITS_MESSAGE="ℹ️ Nenhum commit pendente no ramo base \`$BASE_BRANCH\` para sincronizar com \`$HEAD_BRANCH\`."
+        fi
+        {
+          echo "commits_from_base=$COMMITS_FROM_BASE"
+          echo "is_protected=$IS_PROTECTED"
+          printf 'no_commits_message<<EOF\n%s\nEOF\n' "$NO_COMMITS_MESSAGE"
+        } >> "$GITHUB_OUTPUT"
 
-    steps:
-      - name: Checkout PR head branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
-      - name: Compute sync metadata
-        id: compute-sync
-        env:
-          APPROACH: ${{ env.APPROACH }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-        run: |
-          set -euo pipefail
-          git fetch origin "$BASE_BRANCH" "$HEAD_BRANCH"
-          git checkout "$HEAD_BRANCH"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          COMMITS_FROM_BASE="$(git rev-list --count "HEAD..origin/$BASE_BRANCH" 2>/dev/null || echo 0)"
-          case "$HEAD_BRANCH" in
-            main|staging|development)
-              IS_PROTECTED="true"
-              ;;
-            *)
-              IS_PROTECTED="false"
-              ;;
-          esac
-          NO_COMMITS_MESSAGE=""
-          if [ "$COMMITS_FROM_BASE" -eq 0 ]; then
-            NO_COMMITS_MESSAGE="ℹ️ Nenhum commit pendente no ramo base \`$BASE_BRANCH\` para sincronizar com \`$HEAD_BRANCH\`."
-          fi
-          {
-            echo "commits_from_base=$COMMITS_FROM_BASE"
-            echo "is_protected=$IS_PROTECTED"
-            printf 'no_commits_message<<EOF\n%s\nEOF\n' "$NO_COMMITS_MESSAGE"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Sync protected branch via PR
-        id: sync-protected
-        if: ${{ steps.compute-sync.outputs.commits_from_base != '0' && steps.compute-sync.outputs.is_protected == 'true' }}
-        env:
-          APPROACH: ${{ env.APPROACH }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-          COMMITS_FROM_BASE: ${{ steps.compute-sync.outputs.commits_from_base }}
-        run: |
-          set -euo pipefail
-          GITHUB_API_URL="https://api.github.com"
-          TS="$(date -u +%Y%m%d-%H%M%S)"
-          SYNC_BRANCH="auto-sync/${HEAD_BRANCH}-from-${BASE_BRANCH}-${TS}"
-          git checkout "$HEAD_BRANCH"
-          git checkout -b "$SYNC_BRANCH" "$HEAD_BRANCH"
-          git merge --no-ff "origin/$BASE_BRANCH" -m "chore: sync $HEAD_BRANCH with $BASE_BRANCH"
-          git push origin "$SYNC_BRANCH"
-          PR_TITLE="chore: sync $HEAD_BRANCH with $BASE_BRANCH"
-          PR_BODY="PR automática criada pelo workflow auto-sync para trazer \`$HEAD_BRANCH\` em linha com \`$BASE_BRANCH\`."
-          PR_RESPONSE="$(
-            jq -n \
-              --arg title "$PR_TITLE" \
-              --arg head "$SYNC_BRANCH" \
-              --arg base "$HEAD_BRANCH" \
-              --arg body "$PR_BODY" \
-              '{title:$title, head:$head, base:$base, body:$body}' |
-              curl -sS \
-                -H "Authorization: Bearer $GITHUB_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                -X POST "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls" \
-                -d @-
+    - name: Sync protected branch via PR
+      id: sync-protected
+      if: ${{ steps.compute-sync.outputs.commits_from_base != '0' && steps.compute-sync.outputs.is_protected == 'true' }}
+      shell: bash
+      env:
+        APPROACH: ${{ inputs.approach }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        COMMITS_FROM_BASE: ${{ steps.compute-sync.outputs.commits_from_base }}
+      run: |
+        set -euo pipefail
+        GITHUB_API_URL="https://api.github.com"
+        TS="$(date -u +%Y%m%d-%H%M%S)"
+        SYNC_BRANCH="auto-sync/${HEAD_BRANCH}-from-${BASE_BRANCH}-${TS}"
+        git checkout "$HEAD_BRANCH"
+        git checkout -b "$SYNC_BRANCH" "$HEAD_BRANCH"
+        git merge --no-ff "origin/$BASE_BRANCH" -m "chore: sync $HEAD_BRANCH with $BASE_BRANCH"
+        git push origin "$SYNC_BRANCH"
+        PR_TITLE="chore: sync $HEAD_BRANCH with $BASE_BRANCH"
+        PR_BODY="PR automática criada pelo workflow auto-sync para trazer \`$HEAD_BRANCH\` em linha com \`$BASE_BRANCH\`."
+        PR_RESPONSE="$(
+          jq -n \
+            --arg title "$PR_TITLE" \
+            --arg head "$SYNC_BRANCH" \
+            --arg base "$HEAD_BRANCH" \
+            --arg body "$PR_BODY" \
+            '{title:$title, head:$head, base:$base, body:$body}' |
+            curl -sS \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -X POST "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls" \
+              -d @-
+        )"
+        SYNC_PR_NUMBER="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.number // ""')"
+        SYNC_PR_URL="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.html_url // ""')"
+        UPDATED_COMMITS="false"
+        SYNC_MODE="pr_error"
+        SYNC_COMMITS_MESSAGE=""
+        if [ -n "$SYNC_PR_NUMBER" ]; then
+          MERGE_RESPONSE="$(
+            curl -sS \
+              -X PUT \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$SYNC_PR_NUMBER/merge" \
+              -d "{\"merge_method\":\"$APPROACH\"}"
           )"
-          SYNC_PR_NUMBER="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.number // ""')"
-          SYNC_PR_URL="$(printf '%s\n' "$PR_RESPONSE" | jq -r '.html_url // ""')"
-          UPDATED_COMMITS="false"
-          SYNC_MODE="pr_error"
-          SYNC_COMMITS_MESSAGE=""
-          if [ -n "$SYNC_PR_NUMBER" ]; then
-            MERGE_RESPONSE="$(
-              curl -sS \
-                -X PUT \
-                -H "Authorization: Bearer $GITHUB_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$SYNC_PR_NUMBER/merge" \
-                -d "{\"merge_method\":\"$APPROACH\"}"
-            )"
-            MERGED="$(printf '%s\n' "$MERGE_RESPONSE" | jq -r '.merged // false')"
-            if [ "$MERGED" = "true" ]; then
-              UPDATED_COMMITS="true"
-              SYNC_MODE="pr_merged"
-              SYNC_COMMITS_MESSAGE="🔄 Merge executado com estratégia \`$APPROACH\`."
-              curl -sS \
-                -X DELETE \
-                -H "Authorization: Bearer $GITHUB_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/refs/heads/$SYNC_BRANCH" || true
-            fi
+          MERGED="$(printf '%s\n' "$MERGE_RESPONSE" | jq -r '.merged // false')"
+          if [ "$MERGED" = "true" ]; then
+            UPDATED_COMMITS="true"
+            SYNC_MODE="pr_merged"
+            SYNC_COMMITS_MESSAGE="🔄 Merge executado com estratégia \`$APPROACH\`."
+            curl -sS \
+              -X DELETE \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/refs/heads/$SYNC_BRANCH" || true
           fi
-          {
-            echo "updated_commits=$UPDATED_COMMITS"
-            echo "sync_mode=$SYNC_MODE"
-            echo "sync_pr_url=$SYNC_PR_URL"
-            echo "sync_pr_number=$SYNC_PR_NUMBER"
-            echo "sync_branch=$SYNC_BRANCH"
-            printf 'message_commits<<EOF\n%s\nEOF\n' "$SYNC_COMMITS_MESSAGE"
-          } >> "$GITHUB_OUTPUT"
+        fi
+        {
+          echo "updated_commits=$UPDATED_COMMITS"
+          echo "sync_mode=$SYNC_MODE"
+          echo "sync_pr_url=$SYNC_PR_URL"
+          echo "sync_pr_number=$SYNC_PR_NUMBER"
+          echo "sync_branch=$SYNC_BRANCH"
+          printf 'message_commits<<EOF\n%s\nEOF\n' "$SYNC_COMMITS_MESSAGE"
+        } >> "$GITHUB_OUTPUT"
 
-      - name: Sync non-protected branch directly
-        id: sync-direct
-        if: ${{ steps.compute-sync.outputs.commits_from_base != '0' && steps.compute-sync.outputs.is_protected != 'true' }}
-        env:
-          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-          COMMITS_FROM_BASE: ${{ steps.compute-sync.outputs.commits_from_base }}
-        run: |
-          set -euo pipefail
-          git checkout "$HEAD_BRANCH"
-          git merge --no-ff "origin/$BASE_BRANCH" -m "chore: sync $HEAD_BRANCH with $BASE_BRANCH"
-          git push origin "HEAD:$HEAD_BRANCH"
-          {
-            echo "updated_commits=true"
-            echo "sync_mode=direct"
-            echo "sync_pr_url="
-            echo "sync_pr_number="
-            echo "sync_branch="
-            printf 'message_commits<<EOF\n%s\nEOF\n' "🔄 Merge executado com estratégia \`$APPROACH\`."
-          } >> "$GITHUB_OUTPUT"
+    - name: Sync non-protected branch directly
+      id: sync-direct
+      if: ${{ steps.compute-sync.outputs.commits_from_base != '0' && steps.compute-sync.outputs.is_protected != 'true' }}
+      shell: bash
+      env:
+        APPROACH: ${{ inputs.approach }}
+        BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        COMMITS_FROM_BASE: ${{ steps.compute-sync.outputs.commits_from_base }}
+      run: |
+        set -euo pipefail
+        git checkout "$HEAD_BRANCH"
+        git merge --no-ff "origin/$BASE_BRANCH" -m "chore: sync $HEAD_BRANCH with $BASE_BRANCH"
+        git push origin "HEAD:$HEAD_BRANCH"
+        {
+          echo "updated_commits=true"
+          echo "sync_mode=direct"
+          echo "sync_pr_url="
+          echo "sync_pr_number="
+          echo "sync_branch="
+          printf 'message_commits<<EOF\n%s\nEOF\n' "🔄 Merge executado com estratégia \`$APPROACH\`."
+        } >> "$GITHUB_OUTPUT"
 
-      - name: Aggregate sync results
-        id: sync-commits
-        run: echo ok
+    - name: Aggregate sync results
+      id: sync-commits
+      shell: bash
+      env:
+        PROTECTED_UPDATED: ${{ steps.sync-protected.outputs.updated_commits }}
+        DIRECT_UPDATED: ${{ steps.sync-direct.outputs.updated_commits }}
+        PROTECTED_MODE: ${{ steps.sync-protected.outputs.sync_mode }}
+        DIRECT_MODE: ${{ steps.sync-direct.outputs.sync_mode }}
+        PROTECTED_URL: ${{ steps.sync-protected.outputs.sync_pr_url }}
+        DIRECT_URL: ${{ steps.sync-direct.outputs.sync_pr_url }}
+      run: |
+        set -euo pipefail
+        UPDATED="${PROTECTED_UPDATED:-}"
+        if [ -z "$UPDATED" ]; then
+          UPDATED="${DIRECT_UPDATED:-false}"
+        fi
+        MODE="${PROTECTED_MODE:-}"
+        if [ -z "$MODE" ]; then
+          MODE="${DIRECT_MODE:-none}"
+        fi
+        URL="${PROTECTED_URL:-}"
+        if [ -z "$URL" ]; then
+          URL="${DIRECT_URL:-}"
+        fi
+        {
+          echo "updated_commits=$UPDATED"
+          echo "sync_mode=$MODE"
+          echo "sync_pr_url=$URL"
+        } >> "$GITHUB_OUTPUT"
 
-      - name: Check file diff between head and base branch
-        id: diff-status
-        run: echo ok
+    - name: Check file diff between head and base branch
+      id: diff-status
+      shell: bash
+      run: echo "ok"
 
-      - name: Branch protection checklist
-        id: repo-settings
-        uses: Malnati/check-permissions@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          pr_number: ${{ github.event.pull_request.number }}
-          base_branch: ${{ github.event.pull_request.base.ref }}
+    - name: Branch protection checklist
+      id: repo-settings
+      uses: Malnati/check-permissions@v1
+      with:
+        token: ${{ inputs.token }}
+        pr_number: ${{ github.event.pull_request.number }}
+        base_branch: ${{ github.event.pull_request.base.ref }}
 
-      - name: Build PR comment message
-        id: build-pr-message
-        run: echo ok
+    - name: Build PR comment message
+      id: build-pr-message
+      shell: bash
+      run: echo "ok"
 
-      - name: Comment sync and changed files status
-        uses: Malnati/pr-comment@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          pr_number: ${{ github.event.pull_request.number }}
-          header_actor: ${{ steps.build-pr-message.outputs.header_actor }}
-          header_title: ${{ steps.build-pr-message.outputs.header_title }}
-          header_subject: ${{ steps.build-pr-message.outputs.header_subject }}
-          body_message: ${{ steps.build-pr-message.outputs.body_message }}
-          body_scope: ${{ steps.build-pr-message.outputs.body_scope }}
-          body_todo: ${{ steps.build-pr-message.outputs.body_todo }}
-          footer_result: ${{ steps.build-pr-message.outputs.footer_result }}
-          footer_advise: ${{ steps.build-pr-message.outputs.footer_advise }}
+    - name: Comment sync and changed files status
+      uses: Malnati/pr-comment@v2
+      with:
+        token: ${{ inputs.token }}
+        pr_number: ${{ github.event.pull_request.number }}
+        header_actor: ${{ steps.build-pr-message.outputs.header_actor }}
+        header_title: ${{ steps.build-pr-message.outputs.header_title }}
+        header_subject: ${{ steps.build-pr-message.outputs.header_subject }}
+        body_message: ${{ steps.build-pr-message.outputs.body_message }}
+        body_scope: ${{ steps.build-pr-message.outputs.body_scope }}
+        body_todo: ${{ steps.build-pr-message.outputs.body_todo }}
+        footer_result: ${{ steps.build-pr-message.outputs.footer_result }}
+        footer_advise: ${{ steps.build-pr-message.outputs.footer_advise }}
